@@ -292,7 +292,7 @@ spec:
               # Data directory is not empty force a new cluster.
               ls -A ${DATA_DIR_ETCD}/default.etcd
               if [ $? -eq 0 ]; then
-                echo "NITIN NTIIN force new cluster"
+                echo "Force new cluster"
                 pkill etcd
                 exec etcd --name ${HOSTNAME} \
                           --initial-advertise-peer-urls http://${my_hostname}:2380 \
@@ -305,7 +305,7 @@ spec:
                           --quota-backend-bytes=$(($DISK_QUOTA*1024*1024)) \
                           --force-new-cluster
               else
-                echo "NITIN NITIN individual cluster"
+                echo "Initial cluster"
                 exec etcd --name ${HOSTNAME} \
                           --initial-advertise-peer-urls http://${my_hostname}:2380 \
                           --listen-peer-urls http://0.0.0.0:2380 \

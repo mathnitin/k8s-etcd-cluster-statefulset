@@ -1,0 +1,385 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd-svc-hls
+  namespace: default
+  labels:
+    component: etcd
+spec:
+  clusterIP: None
+  ports:
+  - name: etcd-server
+    port: 2380
+    targetPort: 2380
+  - name: etcd-client
+    port: 2379
+    targetPort: 2379
+  selector:
+    component: etcd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd-svc
+  namespace: default
+  labels:
+    component: etcd
+spec:
+  ports:
+  - name: etcd-server
+    port: 2380
+    targetPort: 2380
+  - name: etcd-client
+    port: 2379
+    targetPort: 2379
+  selector:
+    component: etcd
+---
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  name: etcd
+  namespace: default
+  labels:
+    component: etcd
+spec:
+  serviceName: etcd-svc-hls
+  replicas: 3
+  selector:
+    matchLabels:
+      component: etcd
+  template:
+    metadata:
+      name: etcd
+      labels:
+        component: etcd
+    spec:
+      containers:
+      - name: etcd
+        image: gcr.io/google_containers/etcd-amd64:3.2.18
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 2380
+        - containerPort: 2379
+        env:
+        - name: ETCD_INITIAL_CLUSTER_TOKEN
+          value: etcd-cluster
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: DATA_DIR_ETCD
+          value: /var/run/etcd
+        - name: DISK_QUOTA
+          value: "2048"
+        - name: SERVICE_NAME
+          value: etcd-svc
+        - name: SERVICE_NAME_HLS
+          value: etcd-svc-hls
+        readinessProbe:
+          exec:
+            command:
+              - "/bin/sh"
+              - "-ec"
+              - |
+                my_hostname=${HOSTNAME}.${SERVICE_NAME_HLS}.${POD_NAMESPACE}.svc.cluster.local
+                export ETCDCTL_ENDPOINT="http://${my_hostname}:2379"
+
+                netstat -tupln | grep 2379 -c
+                if [ $? -eq 0 ]; then
+                  etcdctl cluster-health | grep "cluster is healthy"
+                  if [ $? -eq 0 ]; then
+                    exit 0
+                  fi
+                  ETCDCTL_API=3 etcdctl member list | grep "isLeader=true"
+                  if [ $? -eq 0 ]; then
+                    exit 0
+                  fi
+                  exit 1
+                else
+                  exit 1
+                fi
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+        livenessProbe:
+          exec:
+            command:
+              - "/bin/sh"
+              - "-ec"
+              - |
+                my_hostname=${HOSTNAME}.${SERVICE_NAME_HLS}.${POD_NAMESPACE}.svc.cluster.local
+                export ETCDCTL_ENDPOINT="http://${my_hostname}:2379"
+
+                netstat -tupln | grep 2379 -c
+                if [ $? -eq 0 ]; then
+                  etcdctl cluster-health | grep "cluster is healthy"
+                  if [ $? -eq 0 ]; then
+                    exit 0
+                  fi
+                  ETCDCTL_API=3 etcdctl member list | grep "isLeader=true"
+                  if [ $? -eq 0 ]; then
+                    exit 0
+                  fi
+                  exit 1
+                else
+                  exit 1
+                fi
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
+        lifecycle:
+          preStop:
+            exec:
+              command:
+                - "/bin/sh"
+                - "-ec"
+                - |
+                  echo "++++ Running pre stop script ++++"
+
+                  my_hostname=${HOSTNAME}.${SERVICE_NAME_HLS}.${POD_NAMESPACE}.svc.cluster.local
+                  echo "Removing Etcd cluster member: $my_hostname"
+
+                  member_hash() {
+                    etcdctl member list | grep "http://${my_hostname}:2380" | cut -d':' -f1 | cut -d'[' -f1
+                  }
+
+                  # EPS for etcd cluster.
+                  EPS=""
+
+                  # Fetch peers for the current service.
+                  peers=`nslookup ${SERVICE_NAME_HLS} | grep ${SERVICE_NAME_HLS} | grep Address | awk '{print $NF}'`
+                  for peer in $peers
+                  do
+                    # Ping the node and make sure it is running.
+                    ping -c1 $peer
+                    if [ $? -eq 0 ]; then
+                      echo "ping success...."
+                      # Make sure the etcdctl cluster for this node is healthy.
+                      curEps="http://$peer:2379"
+                      echo "curEps: ($curEps)"
+                      ETCDCTL_ENDPOINT=${curEps} etcdctl cluster-health | grep "$hostname" | grep "is healthy"
+                      if [ $? -eq 0 ]; then
+                        echo "cluster is healthy...."
+                        EPS=${EPS}${EPS:+,}${curEps}
+                      fi
+                    fi
+                  done
+
+                  echo "EPS: ${EPS}"
+
+                  echo "Removing ${my_hostname} from etcd cluster"
+                  ETCDCTL_ENDPOINT=${EPS} etcdctl member remove $(member_hash)
+                  if [ $? -eq 0 ]; then
+                    echo "Successfully remove the node ($my_hostname)"
+                    while ! ETCDCTL_ENDPOINT=${EPS} etcdctl member list | grep "${my_hostname}" &> /dev/null; do sleep 1; done
+                  fi
+
+                  echo "++++ Done with post start script"
+        command:
+          - "/bin/sh"
+          - "-c"
+          - |
+            echo "++++ Start startup script ++++"
+
+            HOSTNAME=$(hostname)
+
+            # Set up datafs directory
+            mkdir -p /data/${HOSTNAME##*-}
+            ln -s /data/${HOSTNAME##*-} ${DATA_DIR_ETCD}
+
+            if [ -z $DISK_QUOTA ]; then
+              DISK_QUOTA=$((2*1024))
+            fi
+            echo "Disk quota is set to ($DISK_QUOTA)MB"
+
+            my_hostname=${HOSTNAME}.${SERVICE_NAME_HLS}.${POD_NAMESPACE}.svc.cluster.local
+            echo "Bootstrapping Etcd cluster member: $my_hostname"
+
+            # store member id for later member replacement
+            collect_member() {
+              while ! ETCDCTL_ENDPOINT="http://${my_hostname}:2379" etcdctl member list &>/dev/null; do sleep 1; done
+
+              output=$(etcdctl member list | grep "name=${HOSTNAME}" | cut -d':' -f1 | cut -d'[' -f1)
+              echo $output > ${DATA_DIR_ETCD}/member_id
+
+              # Remove rejoining file if it exists.
+              if [ -f ${DATA_DIR_ETCD}/rejoining ]; then
+                rm ${DATA_DIR_ETCD}/rejoining
+              fi
+              exit 0
+            }
+
+            member_hash() {
+              etcdctl member list | grep "http://${my_hostname}:2380" | cut -d':' -f1 | cut -d'[' -f1
+            }
+
+            POD_INDEX=${HOSTNAME##*-}
+
+            # Data directory is not empty.
+            if [ "$(ls -A ${DATA_DIR_ETCD})" ]; then
+              if [ "$POD_INDEX" -gt "0" ]; then
+                # Wait for a cluster to be created, so that we can join it.
+                while ! ETCDCTL_ENDPOINT="http://${SERVICE_NAME}:2379" etcdctl cluster-health &>/dev/null; do sleep 3; done
+
+                # Make sure members are preent for the cluster.
+                while ! ETCDCTL_ENDPOINT="http://${SERVICE_NAME}:2379" etcdctl member list &>/dev/null; do sleep 3; done
+
+                members=$(ETCDCTL_ENDPOINT="http://${SERVICE_NAME}:2379" etcdctl member list)
+                echo $members | grep $my_hostname
+                if [ $? -ne 0 ]; then
+                  echo "Not a member of running cluster. Delete data dir and sync with peers."
+                  rm -Rf ${DATA_DIR_ETCD}/*
+                fi
+              else
+                ETCDCTL_ENDPOINT="http://${SERVICE_NAME}:2379" etcdctl cluster-health
+                if [ $? -eq 0 ]; then
+                  state=$(echo $? | grep "cluster is healthy")
+                  if [ $state -eq 0 ]; then
+                    members=$(ETCDCTL_ENDPOINT="http://${SERVICE_NAME}:2379" etcdctl member list)
+                    echo $members | grep $my_hostname
+                    if [ $? -ne 0 ]; then
+                      echo "cluster is health and node is not part of member list"
+                      rm -Rf ${DATA_DIR_ETCD}/*
+                    fi
+                  fi
+                fi
+              fi
+            fi
+
+            # EPS and Peers for etcd cluster.
+            EPS=""
+            PEERS=""
+
+            # Fetch peers for the current service.
+            peers=`nslookup ${SERVICE_NAME_HLS} | grep ${SERVICE_NAME_HLS} | grep Address | awk '{print $NF}'`
+            for peer in $peers
+            do
+              # Ping the node and make sure it is running.
+              ping -c1 $peer
+              if [ $? -eq 0 ]; then
+                echo "ping success...."
+                # Make sure the etcdctl cluster for this node is healthy.
+                curEps="http://$peer:2379"
+                echo "curEps: ($curEps)"
+                ETCDCTL_ENDPOINT=${curEps} etcdctl cluster-health | grep "$hostname" | grep "is healthy"
+                if [ $? -eq 0 ]; then
+                  echo "cluster is healthy...."
+                  hostname=$(echo $peer | cut -d. -f1)
+                  PEERS="${PEERS}${PEERS:+,}${hostname}=http://$peer:2380"
+                  EPS=${EPS}${EPS:+,}${curEps}
+                fi
+              fi
+            done
+
+            echo "PEERS: ${PEERS}"
+            echo "EPS: ${EPS}"
+
+            if [ -f ${DATA_DIR_ETCD}/rejoining ]; then
+              echo "Have tried to re-join cluster before but failed. So deleteing data directory."
+              rm -Rf ${DATA_DIR_ETCD}/*
+            fi
+
+            echo "HOSTNAME: ${HOSTNAME}"
+
+            if [ -z "$PEERS" ]; then
+              PEERS="${HOSTNAME}=http://${my_hostname}:2380"
+              echo "Create initial cluster"
+              echo "Peers: $PEERS"
+
+              collect_member &
+
+              # Data directory is not empty force a new cluster.
+              ls -A ${DATA_DIR_ETCD}/default.etcd
+              if [ $? -eq 0 ]; then
+                echo "NITIN NTIIN force new cluster"
+                pkill etcd
+                exec etcd --name ${HOSTNAME} \
+                          --initial-advertise-peer-urls http://${my_hostname}:2380 \
+                          --listen-peer-urls http://0.0.0.0:2380 \
+                          --listen-client-urls http://0.0.0.0:2379 \
+                          --advertise-client-urls http://${my_hostname}:2379 \
+                          --initial-cluster-token ${ETCD_INITIAL_CLUSTER_TOKEN} \
+                          --initial-cluster ${PEERS} \
+                          --data-dir ${DATA_DIR_ETCD}/default.etcd \
+                          --quota-backend-bytes=$(($DISK_QUOTA*1024*1024)) \
+                          --force-new-cluster
+              else
+                echo "NITIN NITIN individual cluster"
+                exec etcd --name ${HOSTNAME} \
+                          --initial-advertise-peer-urls http://${my_hostname}:2380 \
+                          --listen-peer-urls http://0.0.0.0:2380 \
+                          --listen-client-urls http://0.0.0.0:2379 \
+                          --advertise-client-urls http://${my_hostname}:2379 \
+                          --initial-cluster-token ${ETCD_INITIAL_CLUSTER_TOKEN} \
+                          --initial-cluster ${PEERS} \
+                          --initial-cluster-state new \
+                          --data-dir ${DATA_DIR_ETCD}/default.etcd \
+                          --quota-backend-bytes=$(($DISK_QUOTA*1024*1024))
+              fi
+            fi
+
+            export ETCDCTL_ENDPOINT=${EPS}
+
+            # re-joining after failure? Data Directory exists.
+            if [ -e ${DATA_DIR_ETCD}/default.etcd ]; then
+              echo "Re-joining etcd member"
+
+              if [ -f ${DATA_DIR_ETCD}/member_id ]; then
+                touch ${DATA_DIR_ETCD}/rejoining
+
+                member_id=$(cat ${DATA_DIR_ETCD}/member_id)
+
+                collect_member &
+
+                # re-join member
+                etcdctl member update ${member_id} http://${my_hostname}:2380
+                exec etcd --name ${HOSTNAME} \
+                          --listen-peer-urls http://0.0.0.0:2380 \
+                          --listen-client-urls http://0.0.0.0:2379 \
+                          --advertise-client-urls http://${my_hostname}:2379 \
+                          --data-dir ${DATA_DIR_ETCD}/default.etcd \
+                          --quota-backend-bytes=$(($DISK_QUOTA*1024*1024))
+              fi
+            fi
+
+            # member already added?
+            MEMBER_HASH=$(member_hash)
+            if [ ! -z ${MEMBER_HASH} ]; then
+              # the member hash exists but for some reason etcd failed
+              # as the datadir has not be created, we can remove the member
+              # and retrieve new hash
+              etcdctl member remove ${MEMBER_HASH}
+            fi
+
+            echo "Adding new member"
+            etcdctl member add ${HOSTNAME} http://${my_hostname}:2380 | grep "^ETCD_" > ${DATA_DIR_ETCD}/new_member_envs
+
+            if [ $? -ne 0 ]; then
+              echo "Exiting"
+              rm -f ${DATA_DIR_ETCD}/new_member_envs
+              exit 1
+            fi
+            cat ${DATA_DIR_ETCD}/new_member_envs
+            source ${DATA_DIR_ETCD}/new_member_envs
+
+            collect_member &
+
+            exec etcd --name ${HOSTNAME} \
+                      --listen-peer-urls http://0.0.0.0:2380 \
+                      --listen-client-urls http://0.0.0.0:2379 \
+                      --advertise-client-urls http://${my_hostname}:2379 \
+                      --data-dir ${DATA_DIR_ETCD}/default.etcd \
+                      --initial-advertise-peer-urls http://${my_hostname}:2380 \
+                      --initial-cluster ${ETCD_INITIAL_CLUSTER} \
+                      --initial-cluster-state ${ETCD_INITIAL_CLUSTER_STATE} \
+                      --quota-backend-bytes=$(($DISK_QUOTA*1024*1024))
+
+            echo "++++ Done startup script"
+        volumeMounts:
+        - mountPath: /data
+          name: etcd-data-vol
+      volumes:
+      - hostPath:
+          path: /data/etcd
+        name: etcd-data-vol
